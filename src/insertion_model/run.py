@@ -1,6 +1,7 @@
 """Train the insertion model."""
 
-import chr1_SRR12322252
+import chr1_exp2_bat1_SRR12322252
+import chr1_exp2_bat1_SRR12322265
 import matplotlib.pyplot as plt
 import pyro
 import torch
@@ -9,21 +10,20 @@ from torch.distributions import constraints
 from tqdm import tqdm
 
 
-# With `alpha` set to 1, the distribution of `beta` is uniform.
-# This means that the remaining part of the "stick" is broken
-# uniformly every time we need to create a cluster. If `alpha`
-# is less than 1, the distribution of `beta` is biased to
-# values closer to 1. This means that the first cluster will
-# tend to have a large weight, leaving little for further
-# clusters. This corresponds to a situation where the data can
-# be fitted into one major cluster. If `alpha` is higher than
-# 1, the distribution of `beta is biased to values closer to 0.
-# This means that the first cluster will be small, leaving a
-# lot for further clusters. This corresponds to a case where
-# multiple clusters are needed to fit the data.
+# With `alpha` set to 1.5, the distribution of `beta` is
+# approximately uniform. This means that the remaining part
+# of the "stick" is broken uniformly every time we need to
+# create a cluster. If `alpha` is less than 1.5, the distribution
+# of `beta` is biased to values closer to 0.5, so this is not a
+# good method to parametrize `beta`. In order to make a better
+# parametrization, one needs to introduce a new hyperparameter
+# that shifts the distribution of `beta` to the left or right,
+# i.e., closer to 0 or closer to 1.
 DEVICE = "cuda"
-T = 25  # max number of breaks; needs a relatively high number but 25 is for exploration.
-alpha = 1 * torch.ones(1).to(DEVICE)
+alpha = 1.5 * torch.ones(1).to(DEVICE)
+
+T = 25  # Max number of breaks; needs a relatively high number but 25 is for exploration.
+N = 2  # Number of replicates.
 
 
 def mix_weights(beta):
@@ -35,8 +35,16 @@ def mix_weights(beta):
     return f.pad(beta, (0, 1), value=1) * f.pad(beta1m_cumprod, (1, 0), value=1)
 
 
-def model(x):
+# The shapes below are described in functions of `P` the number of
+# Pyro particles, which is a runtime parameter, `N` the number of
+# replicates and `T` the maximum number of clusters.
+
+
+def model(x_pos, x_batch):
     """The model."""
+    # Define `n` as the number of observations.
+    n = x_pos.shape[0]
+
     # Sample beta, the stick-breaking parameters. They determine
     # the locations of the breakpoints on the "stick". The "stick"
     # is an abstract object that measures the number of clusters
@@ -44,13 +52,32 @@ def model(x):
     # probabilities (the length of the fragments). There are `T-1`
     # breakpoints, so there are `T` clusters.
     with pyro.plate("T-1", T - 1):
-        beta = pyro.sample(name="beta", fn=pyro.distributions.Beta(1.0, alpha))
+        # Instead of sampling beta directly, we sample eta and
+        # then use the sigmoid function to get beta. This is a
+        # trick to ensure that beta is always between 0 and 1.
+        # Shape(eta): [P, 1, T-1]
+        eta = pyro.sample(
+            "eta",
+            pyro.distributions.Normal(
+                loc=0.0 * torch.ones(T - 1, device=DEVICE),
+                scale=alpha * torch.ones(T - 1, device=DEVICE),
+            ),
+        )
 
-    # NOTE: I keep beta as the name of the variable above, but I
-    # would like to change it. I find it very confusing because
-    # there are two Beta distributions: the first describes the
-    # breaking of the stick, the second describes the positions
-    # of the insertion sites.
+        with pyro.plate("NxT", N):
+            # We "break the stick" `T-1` times, each time creating
+            # a new cluster of a given size. The parameters `eta`
+            # specify how we break the stick and `epsilon` are
+            # little shifts that depend on the batch. This means
+            # that the cluster size depends on the batch.
+            # Shape(epsilon): [P, N, T-1]
+            epsilon = pyro.sample(
+                "epsilon",
+                pyro.distributions.Normal(
+                    loc=0.0 * torch.ones(1, 1, device=DEVICE),
+                    scale=0.05 * torch.ones(1, 1, device=DEVICE),
+                ),
+            )
 
     with pyro.plate("T", T):
         # Each cluster is a Beta(a1, a0) distribution, that is
@@ -63,12 +90,14 @@ def model(x):
         # so that the values are greater than 1 (when a1 or a0 is
         # less than 1, the Beta distribution is u-shaped instead of
         # n-shaped, which has no biological interpretation here).
+        # Shape (a1_): [P, T]
         a1_ = pyro.sample(
             name="a1_",
             fn=pyro.distributions.HalfCauchy(
                 scale=torch.ones(1).to(DEVICE),
             ),
         )
+        # Shape (a0_): [P, T]
         a0_ = pyro.sample(
             name="a0_",
             fn=pyro.distributions.HalfCauchy(
@@ -76,13 +105,42 @@ def model(x):
             ),
         )
 
-    with pyro.plate("obs", x.shape[0]):
+    # NOTE: I keep beta as the name of the variable above, but I
+    # would like to change it. I find it very confusing because
+    # there are two Beta distributions: the first describes the
+    # breaking of the stick, the second describes the positions
+    # of the insertion sites.
+    beta = torch.sigmoid(eta + epsilon)  # Shape: [P, N, T-1]
+
+    with pyro.plate("obs", n):
         # Convert `beta` to probabilities (weight of each cluster).
-        probs = mix_weights(beta).unsqueeze(-2)
+        probs = mix_weights(beta)  # Shape: [P, N, T]
+        # Create indices for gathering along N dimension
+        batch_indices = x_batch.unsqueeze(0).unsqueeze(-1).expand(probs.shape[0], -1, 1)
+        # Gather probabilities for each observation's batch across all T clusters
+        probs_for_each_x = torch.gather(
+            probs, dim=1, index=batch_indices.expand(-1, -1, probs.shape[2])
+        )  # Shape: [P, n, T]
+        # Reshape `probs_for_each_x` because the last dimention (T) does not
+        # contribute to the event shape: it is only used for the parameter
+        # so it is consumed during generation. The implicit "particle"
+        # outer plate has to be at index -3, so we compensate by adding a
+        # dimension now. The tensor has four dimensions, but if we disregard
+        # the last (T) as parameter-only, the numbers coincide with the size
+        # of the plates.
+        # Shape(probs_for_each_x): [P, 1, n, T]
+        probs_for_each_x = probs_for_each_x.unsqueeze(-3)
+        # The implementation below is probably equivalent to the above.
+        # I need to check which works in the context of multiple particles.
+        # batch_indices = x_batch.unsqueeze(0).unsqueeze(-1).expand(probs.shape[0], -1, 1)
+        # batch_indices = batch_indices.expand(-1, -1, probs.shape[2])
+        # # Gather probabilities based on batch indices
+        # probs_per_x = torch.gather(probs, dim=1, index=batch_indices)
         # Sample a cluster for every observation (insertion site).
         z = pyro.sample(
+            # Shape: [P, n]
             name="z",
-            fn=pyro.distributions.Categorical(probs),
+            fn=pyro.distributions.Categorical(probs_for_each_x),
         )
 
         # Finally, the observations are drawn as a Beta distribution
@@ -91,19 +149,19 @@ def model(x):
         # otherwise, it can be quite far from the typical location.
         a1 = a1_.gather(dim=-1, index=z) + 1.0
         a0 = a0_.gather(dim=-1, index=z) + 1.0
-        pyro.sample(name="x", fn=pyro.distributions.Beta(a1, a0), obs=x)
+        pyro.sample(name="x_pos", fn=pyro.distributions.Beta(a1, a0), obs=x_pos)
 
 
-def guide(x):
+def guide(x_pos, x_batch):  # noqa: ARG001
     """The guide."""
-    # The parameter `kappa` controls the variational posterior of
-    # `beta`. The variational posterior of `beta` is assumed to
-    # be Beta(1., kappa), so large values of `kappa` correspond
-    # to smaller `beta`, and therefore clusters of smaller weight.
-    # Reciprocally, small values of `kappa` correspond to bigger
-    # `beta` and therefore clusters of bigger weight.
-    kappa = pyro.param(
-        "kappa", lambda: torch.ones(T - 1).to(DEVICE), constraint=constraints.positive
+    eta_loc = pyro.param("eta_loc", torch.zeros(T - 1, device=DEVICE))
+    eta_scale = pyro.param(
+        "eta_scale", torch.ones(T - 1, device=DEVICE), constraint=constraints.positive
+    )
+
+    epsilon_loc = pyro.param("epsilon_loc", torch.zeros(N, T - 1, device=DEVICE))
+    epsilon_scale = pyro.param(
+        "epsilon_scale", torch.ones(N, T - 1, device=DEVICE), constraint=constraints.positive
     )
 
     # The variational posterior of `a1` and `a0` is log-normal.
@@ -141,37 +199,56 @@ def guide(x):
     # naive initial value, but we should initialize
     # it to a more meaningful value.
     phi = pyro.param(
-        "phi", 1.0 / T * torch.ones(x.shape[0], T).to(DEVICE), constraint=constraints.simplex
+        "phi", 1.0 / T * torch.ones(x_pos.shape[0], T).to(DEVICE), constraint=constraints.simplex
     )
 
     # This is the variational posterior distribution
     # of the `beta` coefficients.
     with pyro.plate("T-1", T - 1):
-        pyro.sample(name="beta", fn=pyro.distributions.Beta(torch.ones(1).to(DEVICE), kappa))
+        _ = pyro.sample("eta", pyro.distributions.Normal(eta_loc, eta_scale))
+
+        with pyro.plate("NxT", N):
+            _ = pyro.sample("epsilon", pyro.distributions.Normal(epsilon_loc, epsilon_scale))
 
     # This is the variational posterior distribution
     # of `a1_` and `a0_`. The log-normal distribution
     # allows us to interpret the parameters in a
     # relatively easy way.
     with pyro.plate("T", T):
-        pyro.sample(name="a1_", fn=pyro.distributions.LogNormal(a1_mu, a1_sd))
-        pyro.sample(name="a0_", fn=pyro.distributions.LogNormal(a0_mu, a0_sd))
+        _ = pyro.sample(name="a1_", fn=pyro.distributions.LogNormal(a1_mu, a1_sd))
+        _ = pyro.sample(name="a0_", fn=pyro.distributions.LogNormal(a0_mu, a0_sd))
 
     # This is the variational posterior of the cluster
     # assignment. This is a discrete distribution so
     # we should use enumeration to speed up the inference
     # but we are going to leave it as is for now.
-    with pyro.plate("obs", x.shape[0]):
-        pyro.sample(
+    with pyro.plate("obs", x_pos.shape[0]):
+        _ = pyro.sample(
             name="z",
             fn=pyro.distributions.Categorical(phi),
         )
 
 
-x = torch.tensor(chr1_SRR12322252.x).to(DEVICE)
+x_pos_1 = torch.tensor(chr1_exp2_bat1_SRR12322252.x)
+x_pos_2 = torch.tensor(chr1_exp2_bat1_SRR12322265.x)
+
+x_pos = torch.cat([x_pos_1, x_pos_2], dim=0).to(DEVICE)
+x_batch = (
+    torch.cat([torch.zeros(x_pos_1.shape[0]), torch.ones(x_pos_2.shape[0])], dim=0)
+    .long()
+    .to(DEVICE)
+)
+
 optim = pyro.optim.Adam({"lr": 0.01})
 svi = pyro.infer.SVI(
-    model, guide, optim, loss=pyro.infer.Trace_ELBO(vectorize_particles=True, num_particles=24)
+    model,
+    guide,
+    optim,
+    loss=pyro.infer.Trace_ELBO(
+        vectorize_particles=True,
+        num_particles=24,
+        max_plate_nesting=2,
+    ),
 )
 losses = []
 
@@ -180,13 +257,16 @@ def train(num_iterations):
     """Train the model."""
     pyro.clear_param_store()
     for _ in tqdm(range(num_iterations)):
-        loss = svi.step(x)
+        loss = svi.step(x_pos, x_batch)
         losses.append(loss)
 
 
 train(5000)
 
-print(pyro.param("kappa"))
+print(pyro.param("eta_loc"))
+print(pyro.param("eta_scale"))
+print(pyro.param("epsilon_loc"))
+print(pyro.param("epsilon_scale"))
 print(pyro.param("phi"))
 print(pyro.param("a1_mu"))
 print(pyro.param("a1_sd"))
