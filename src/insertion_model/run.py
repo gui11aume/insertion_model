@@ -55,7 +55,7 @@ def model(x_pos, x_batch):
         # Instead of sampling beta directly, we sample eta and
         # then use the sigmoid function to get beta. This is a
         # trick to ensure that beta is always between 0 and 1.
-        # Shape(eta): [P, 1, T-1]
+        # Shape (eta): [P, 1, T-1]
         eta = pyro.sample(
             "eta",
             pyro.distributions.Normal(
@@ -64,13 +64,13 @@ def model(x_pos, x_batch):
             ),
         )
 
-        with pyro.plate("NxT", N):
+        with pyro.plate("NxT-1", N):
             # We "break the stick" `T-1` times, each time creating
             # a new cluster of a given size. The parameters `eta`
             # specify how we break the stick and `epsilon` are
             # little shifts that depend on the batch. This means
             # that the cluster size depends on the batch.
-            # Shape(epsilon): [P, N, T-1]
+            # Shape (epsilon): [P, N, T-1]
             epsilon = pyro.sample(
                 "epsilon",
                 pyro.distributions.Normal(
@@ -90,14 +90,14 @@ def model(x_pos, x_batch):
         # so that the values are greater than 1 (when a1 or a0 is
         # less than 1, the Beta distribution is u-shaped instead of
         # n-shaped, which has no biological interpretation here).
-        # Shape (a1_): [P, T]
+        # Shape (a1_): [P, 1, T]
         a1_ = pyro.sample(
             name="a1_",
             fn=pyro.distributions.HalfCauchy(
                 scale=torch.ones(1).to(DEVICE),
             ),
         )
-        # Shape (a0_): [P, T]
+        # Shape (a0_): [P, 1, T]
         a0_ = pyro.sample(
             name="a0_",
             fn=pyro.distributions.HalfCauchy(
@@ -120,7 +120,7 @@ def model(x_pos, x_batch):
         # Gather probabilities for each observation's batch across all T clusters
         probs_for_each_x = torch.gather(
             probs, dim=1, index=batch_indices.expand(-1, -1, probs.shape[2])
-        )  # Shape: [P, n, T]
+        )  # Shape(probs_for_each_x): [P, n, T]
         # Reshape `probs_for_each_x` because the last dimention (T) does not
         # contribute to the event shape: it is only used for the parameter
         # so it is consumed during generation. The implicit "particle"
@@ -128,17 +128,11 @@ def model(x_pos, x_batch):
         # dimension now. The tensor has four dimensions, but if we disregard
         # the last (T) as parameter-only, the numbers coincide with the size
         # of the plates.
-        # Shape(probs_for_each_x): [P, 1, n, T]
+        # Shape (probs_for_each_x): [P, 1, n, T]
         probs_for_each_x = probs_for_each_x.unsqueeze(-3)
-        # The implementation below is probably equivalent to the above.
-        # I need to check which works in the context of multiple particles.
-        # batch_indices = x_batch.unsqueeze(0).unsqueeze(-1).expand(probs.shape[0], -1, 1)
-        # batch_indices = batch_indices.expand(-1, -1, probs.shape[2])
-        # # Gather probabilities based on batch indices
-        # probs_per_x = torch.gather(probs, dim=1, index=batch_indices)
         # Sample a cluster for every observation (insertion site).
+        # Shape (z): [P, 1, n]
         z = pyro.sample(
-            # Shape: [P, n]
             name="z",
             fn=pyro.distributions.Categorical(probs_for_each_x),
         )
@@ -147,8 +141,8 @@ def model(x_pos, x_batch):
         # from the cluster that was assigned to them. If a1 and a0 are
         # large, the observation will be close to a1 / (a0 + a1),
         # otherwise, it can be quite far from the typical location.
-        a1 = a1_.gather(dim=-1, index=z) + 1.0
-        a0 = a0_.gather(dim=-1, index=z) + 1.0
+        a1 = a1_.gather(dim=-1, index=z) + 1.0  # Shape (a1): [P, 1, n]
+        a0 = a0_.gather(dim=-1, index=z) + 1.0  # Shape (a0): [P, 1, n]
         pyro.sample(name="x_pos", fn=pyro.distributions.Beta(a1, a0), obs=x_pos)
 
 
